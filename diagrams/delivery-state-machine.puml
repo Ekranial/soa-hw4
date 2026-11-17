@@ -1,0 +1,40 @@
+@startuml delivery-state-machine
+title Машина состояний доставки транзакционного уведомления (общая для вариантов A и B)
+
+skinparam state {
+  BackgroundColor<<terminal>> #E8F5E9
+  BackgroundColor<<fail>> #FFEBEE
+}
+
+state ACCEPTED : запрос принят и надёжно сохранён\n(повторный запрос с тем же\nidempotency_key → тот же notification_id)
+state ROUTED : построен план каналов\n(настройки клиента + живые устройства)\nпример: [push, sms, email]
+state ATTEMPTING : отправка в канал i через провайдера;\nпри создании попытки ставится дедлайн:\npush 10 с, SMS 90 с, email 180 с\n(в сумме 280 с < общего дедлайна 5 мин)
+state AWAITING_RECEIPT : провайдер принял сообщение,\nждём подтверждение доставки
+state NEXT <<choice>>
+state DELIVERED <<terminal>> : подтверждено хотя бы одним каналом\n(ACK приложения / DLR SMS / delivered email)
+state FAILED <<fail>> : каналы исчерпаны или общий дедлайн 5 мин\n→ алерт, событие продукту, запись в in-app ленту
+
+[*] --> ACCEPTED
+ACCEPTED --> ROUTED
+ROUTED --> ATTEMPTING : i = 0
+ROUTED --> NEXT : канал i недоступен\n(нет push-токена, канал отключён)
+ATTEMPTING --> ATTEMPTING : ошибка провайдера →\nрезервный провайдер того же канала
+ATTEMPTING --> AWAITING_RECEIPT : провайдер принял (attempt_id)
+ATTEMPTING --> NEXT : все провайдеры канала недоступны\nили истёк дедлайн попытки
+ATTEMPTING --> DELIVERED : подтверждение пришло раньше,\nчем событие «провайдер принял»
+AWAITING_RECEIPT --> DELIVERED : подтверждение доставки
+AWAITING_RECEIPT --> NEXT : таймаут подтверждения\nили отрицательный DLR / bounce
+NEXT --> ATTEMPTING : есть канал i+1
+NEXT --> FAILED : каналов больше нет
+DELIVERED --> [*]
+FAILED --> [*]
+
+note right of DELIVERED
+  Подтверждение по предыдущему каналу,
+  пришедшее после DELIVERED, только
+  записывается в метрику дублей.
+  Переходы — условные UPDATE
+  (state + version), поэтому failover
+  запускается ровно один раз.
+end note
+@enduml

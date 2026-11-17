@@ -1,0 +1,47 @@
+@startuml b-seq-main
+title Вариант B. Основной сценарий: транзакционное уведомление доставлено через push
+autonumber
+skinparam responseMessageBelowArrow true
+
+participant "Платёжный\nсервис" as P
+participant "Notification\nAPI" as API
+participant "Temporal\nServer" as T
+database "Cassandra\n(история)" as C
+participant "Delivery Worker\n(workflow + activities)" as W
+database "Redis\n(кеш)" as R
+participant "FCM /\nAPNs" as FCM
+actor "Мобильное\nприложение" as APP
+participant "Receipt\nGateway" as RG
+queue "Kafka" as K
+
+P -> API: SendNotification(idempotency_key = "pay-123:debited",\ntype = TRANSACTIONAL, user_id, template, params)
+API -> T: StartWorkflow(CriticalDelivery,\nworkflow_id = UUIDv5(producer, idempotency_key),\nreuse_policy = RejectDuplicate)
+T -> C: WorkflowExecutionStarted
+T --> API: run_id (повторный старт с тем же id →\nWorkflowAlreadyStarted, дубль не создаётся)
+API --> P: 202 Accepted {notification_id = workflow_id}
+
+T -> W: workflow task (task queue critical-delivery)
+W -> W: activity BuildRoutingPlan
+W -> R: настройки + активные push-токены
+R --> W: план [push, sms, email]
+W -> T: ScheduleActivity SendPush
+T -> C: ActivityTaskScheduled
+T -> W: activity task SendPush
+W -> FCM: send(token, collapse_id = notification_id,\ndata = {notification_id, attempt_id})
+FCM --> W: 200 OK
+W -> T: ActivityTaskCompleted
+W -> T: workflow: await Signal("receipt") ИЛИ Timer(10 с)
+T -> C: TimerStarted
+
+FCM -> APP: push-уведомление
+APP -> RG: POST /receipts {notification_id, attempt_id}
+RG -> T: SignalWorkflow(workflow_id, receipt{push, attempt_id})
+T -> C: WorkflowExecutionSignaled; таймер отменён
+T -> W: workflow task
+W -> T: ScheduleActivity PublishStatus
+T -> W: activity task
+W -> K: notif.status: DELIVERED {channel = push}
+W -> T: CompleteWorkflow(DELIVERED)
+T -> C: WorkflowExecutionCompleted
+note over P, K: ≈ 25 событий истории на уведомление (на схеме показаны ключевые; каждое — запись в Cassandra).\nПлюс ~10–30 мс задержки на каждый оборот workflow ↔ Temporal (расчёт в RFC, раздел 6.4)
+@enduml

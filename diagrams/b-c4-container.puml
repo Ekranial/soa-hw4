@@ -1,0 +1,51 @@
+@startuml b-c4-container
+!include <C4/C4_Container>
+
+title Вариант B. Durable workflow на Temporal (C4, уровень Container)
+
+LAYOUT_TOP_DOWN()
+
+Person(client, "Клиент банка", "Мобильное приложение, телефон, почта")
+System_Ext(producers, "Продуктовые сервисы", "Платежи, переводы, карты, кредиты")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go, gRPC", "Приём и валидация. StartWorkflow(id = UUIDv5(producer, idempotency_key), RejectDuplicate). Ответ 202")
+  Container(temporal, "Temporal Server", "Temporal 1.2x: frontend, history, matching", "Хранит историю каждого workflow, таймеры, очереди задач, доставляет сигналы")
+  ContainerDb(tdb, "Temporal Persistence", "Cassandra 4, 6+ узлов, RF=3", "История workflow, таймеры, очереди задач")
+  ContainerDb(es, "Temporal Visibility", "Elasticsearch", "Поиск workflow по атрибутам (user_id, статус)")
+  Container(worker, "Delivery Workers", "Go, Temporal SDK, N реплик", "Workflow CriticalDelivery: план каналов, ожидание подтверждения с таймером, failover. Activities: SendPush, SendSms, SendEmail, PublishStatus")
+  Container(receipts, "Receipt Gateway", "Go, HTTPS", "ACK от приложения, DLR от SMS, вебхуки email → SignalWorkflow")
+  Container(prefs, "Preference & Device Service", "Go + PostgreSQL", "Настройки каналов, токены устройств")
+  ContainerDb(redis, "Redis Cluster", "Redis 7", "Кеш настроек и токенов, счётчики квот провайдеров")
+  ContainerQueue(kafka, "Kafka", "3 брокера, RF=3", "notif.status: статусы для продуктов и аналитики")
+  Container(status, "Status API", "Go", "Статус и история (Temporal visibility + ClickHouse)")
+  ContainerDb(ch, "ClickHouse", "", "Журнал событий доставки, SLO-аналитика")
+  Container(obs, "Observability", "OpenTelemetry Collector, Prometheus, Grafana, Tempo, Temporal Web UI", "Все контейнеры отправляют метрики, трейсы и логи. SLO-алерты через Alertmanager")
+}
+
+System_Ext(fcm, "FCM / APNs", "Push-провайдеры")
+System_Ext(sms, "SMS-провайдеры A и B", "SMPP / HTTP, DLR-вебхуки")
+System_Ext(email, "Email-провайдеры", "SMTP / HTTP, вебхуки delivered/bounce")
+
+Rel(producers, api, "SendNotification", "gRPC")
+Rel(api, temporal, "StartWorkflow", "gRPC")
+Rel(temporal, tdb, "история, таймеры", "CQL")
+Rel(temporal, es, "visibility")
+Rel(worker, temporal, "poll задач, команды workflow", "gRPC, task queue critical-delivery")
+Rel(worker, redis, "настройки, токены, квоты", "RESP")
+Rel(worker, fcm, "SendPush", "HTTP/2")
+Rel(worker, sms, "SendSms", "SMPP/HTTP")
+Rel(worker, email, "SendEmail", "SMTP/HTTP")
+Rel(worker, kafka, "PublishStatus")
+Rel(fcm, client, "push")
+Rel(sms, client, "SMS")
+Rel(email, client, "email")
+Rel(client, receipts, "ACK о показе push", "HTTPS")
+Rel(sms, receipts, "DLR", "webhook")
+Rel(email, receipts, "delivered / bounce", "webhook")
+Rel(receipts, temporal, "SignalWorkflow(receipt)", "gRPC")
+Rel(prefs, redis, "инвалидация кеша при изменении")
+Rel(kafka, ch, "notif.status", "Kafka engine")
+Rel(status, ch, "история", "SQL")
+Rel(status, temporal, "состояние workflow", "gRPC")
+@enduml

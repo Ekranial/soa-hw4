@@ -1,0 +1,60 @@
+@startuml a-seq-failover
+title Вариант A. Failover: push не подтверждён → SMS (провайдер A недоступен → провайдер B)
+autonumber
+skinparam responseMessageBelowArrow true
+
+queue "Kafka" as K
+participant "Delivery\nOrchestrator" as O
+database "Delivery\nState DB" as DB
+participant "Timeout\nScheduler" as TS
+participant "SMS\nSender" as SS
+participant "SMS-\nпровайдер A" as SA
+participant "SMS-\nпровайдер B" as SB
+participant "Receipt\nGateway" as RG
+actor "Мобильное\nприложение" as APP
+
+note over K, DB: Исходно: попытка #1 (push) принята FCM/APNs,\nstate = AWAITING_RECEIPT, дедлайн = T + 10 с. ACK от приложения нет\n(телефон офлайн, уведомления выключены в ОС, токен устарел)
+
+== Через 10 с: дедлайн истёк ==
+TS -> DB: SELECT … FROM deadlines WHERE due_at <= now()\nFOR UPDATE SKIP LOCKED LIMIT 500
+DB --> TS: notification N, attempt #1
+TS -> K: delivery.events: TIMEOUT(attempt #1)
+TS -> DB: DELETE deadline
+K -> O: consume TIMEOUT
+O -> DB: BEGIN; UPDATE notification SET state = ATTEMPTING, channel_idx = 1,\nversion = v + 1 WHERE id = N\nAND state IN (ATTEMPTING, AWAITING_RECEIPT)\nAND current_attempt_id = #1 AND version = v
+DB --> O: 1 строка (переход выполнен ровно один раз;\n0 строк — уже доставлено или это TIMEOUT\nустаревшей попытки: failover не нужен)
+O -> DB: INSERT attempt #2 (sms); deadline = now() + 90 с; COMMIT
+O -> K: delivery.commands.sms {attempt_id = #2}
+K -> SS: consume
+
+== Отказ провайдера внутри канала ==
+SS -> SA: submit(phone, text, client_ref = attempt #2)
+SA --> SS: 503 / таймаут 2 с
+SS -> SS: circuit breaker A: ошибка учтена\n(при ≥ 50 % ошибок за 30 с → OPEN, A исключается из маршрута)
+SS -> SB: submit(phone, text, client_ref = attempt #2)
+SB --> SS: accepted {provider_msg_id}
+SS -> K: delivery.events: ATTEMPT_ACCEPTED(sms, provider = B)
+K -> O: consume
+O -> DB: UPDATE … SET state = AWAITING_RECEIPT WHERE state = ATTEMPTING
+
+== Подтверждение доставки SMS ==
+SB -> RG: DLR webhook {provider_msg_id, status = DELIVERED}
+RG -> K: delivery.events: RECEIPT(sms, attempt #2)
+K -> O: consume
+O -> DB: UPDATE … SET state = DELIVERED\nWHERE state IN (ATTEMPTING, AWAITING_RECEIPT); DELETE deadline
+O -> K: notif.status: DELIVERED {channel = sms, failover = true}
+
+== Запоздавший ACK по push ==
+APP -> RG: POST /receipts {notification_id = N, attempt #1}\n(телефон вышел в сеть)
+RG -> K: delivery.events: RECEIPT(push, attempt #1)
+K -> O: consume
+O -> DB: UPDATE … WHERE state IN (ATTEMPTING, AWAITING_RECEIPT)\n→ 0 строк (уже DELIVERED)
+O -> O: метрика late_receipt / cross_channel_duplicate,\nновых отправок нет
+
+alt DLR = FAILED или нет DLR за 90 с
+  O -> K: delivery.commands.email (попытка #3, дедлайн 180 с)
+else все каналы исчерпаны или прошло 5 мин
+  O -> DB: state = FAILED
+  O -> K: notif.status: FAILED → алерт дежурному и событие продукту
+end
+@enduml

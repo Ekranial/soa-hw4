@@ -1,0 +1,53 @@
+@startuml b-seq-failover
+title Вариант B. Failover: push не подтверждён → SMS (провайдер A недоступен → провайдер B)
+autonumber
+skinparam responseMessageBelowArrow true
+
+participant "Temporal\nServer" as T
+participant "Delivery Worker\n(workflow)" as WF
+participant "Delivery Worker\n(activities)" as WA
+participant "SMS-\nпровайдер A" as SA
+participant "SMS-\nпровайдер B" as SB
+participant "Receipt\nGateway" as RG
+actor "Мобильное\nприложение" as APP
+queue "Kafka" as K
+
+note over T, WF: Исходно: activity SendPush завершена, workflow ждёт\nSignal("receipt") или Timer(10 с). Сигнала нет
+
+== Через 10 с: таймер сработал ==
+T -> T: TimerFired (переживает рестарт воркеров:\nтаймер хранится в Cassandra)
+T -> WF: workflow task
+WF -> T: ScheduleActivity SendSms(attempt #2)\nRetryPolicy: 3 попытки, backoff 1 с → 2 с
+T -> WA: activity task
+
+== Отказ провайдера внутри канала ==
+WA -> SA: submit(phone, text, client_ref = attempt #2)
+SA --> WA: 503 / таймаут 2 с
+WA -> WA: circuit breaker A: ошибка учтена,\nмаршрут → провайдер B
+WA -> SB: submit(phone, text, client_ref = attempt #2)
+SB --> WA: accepted {provider_msg_id}
+WA -> T: ActivityTaskCompleted(provider = B)
+T -> WF: workflow task
+WF -> T: await Signal("receipt", attempt #2) ИЛИ Timer(90 с)
+
+== Подтверждение доставки SMS ==
+SB -> RG: DLR webhook {provider_msg_id, DELIVERED}
+RG -> T: SignalWorkflow(workflow_id, receipt{sms, attempt #2})
+T -> WF: workflow task
+WF -> T: ScheduleActivity PublishStatus
+T -> WA: activity task
+WA -> K: notif.status: DELIVERED {channel = sms, failover = true}
+WF -> T: CompleteWorkflow(DELIVERED)
+
+== Запоздавший ACK по push ==
+APP -> RG: POST /receipts {attempt #1}
+RG -> T: SignalWorkflow(workflow_id, receipt{push})
+T --> RG: ошибка: workflow уже завершён
+RG -> RG: метрика late_receipt / cross_channel_duplicate
+
+alt DLR = FAILED или нет сигнала за 90 с
+  WF -> T: ScheduleActivity SendEmail (попытка #3, ожидание 180 с)
+else каналы исчерпаны или WorkflowRunTimeout = 5 мин
+  WF -> T: PublishStatus FAILED → CompleteWorkflow(FAILED) → алерт
+end
+@enduml

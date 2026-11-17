@@ -1,0 +1,60 @@
+@startuml a-c4-container
+!include <C4/C4_Container>
+
+title Вариант A. Event-driven оркестратор на Kafka + PostgreSQL (C4, уровень Container)
+
+LAYOUT_TOP_DOWN()
+
+Person(client, "Клиент банка", "Мобильное приложение, телефон, почта")
+System_Ext(producers, "Продуктовые сервисы", "Платежи, переводы, карты, кредиты")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go, gRPC", "Приём и валидация. notification_id = UUIDv5(producer, idempotency_key). Ответ 202 после записи в Kafka")
+  ContainerQueue(kafka, "Kafka", "3 брокера в 3 AZ, RF=3, min.insync=2", "notif.transactional.requests, delivery.commands.{push,sms,email}, delivery.events, notif.status. Ключ партиции: notification_id")
+  Container(orch, "Delivery Orchestrator", "Go, N реплик", "Машина состояний: план каналов, переходы, решение о failover")
+  ContainerDb(statedb, "Delivery State DB", "PostgreSQL 16 + Patroni, синхронная реплика", "notifications, attempts, deadlines. Партиции по дням")
+  Container(sched, "Timeout Scheduler", "Go, 2+ реплики", "Выбирает истёкшие дедлайны (FOR UPDATE SKIP LOCKED) и публикует TIMEOUT")
+  Container(push, "Push Sender", "Go", "Адаптеры FCM и APNs (HTTP/2)")
+  Container(smsw, "SMS Sender", "Go", "Адаптеры SMS A и B, circuit breaker, маршрутизация по здоровью, квоты")
+  Container(emailw, "Email Sender", "Go", "Адаптеры email-провайдеров")
+  Container(receipts, "Receipt Gateway", "Go, HTTPS", "ACK от приложения, DLR от SMS, вебхуки email")
+  Container(prefs, "Preference & Device Service", "Go + PostgreSQL", "Настройки каналов, токены устройств")
+  ContainerDb(redis, "Redis Cluster", "Redis 7", "Кеш настроек и токенов, счётчики квот (не источник истины)")
+  Container(status, "Status API", "Go", "Статус и история уведомления для поддержки и продуктов")
+  ContainerDb(ch, "ClickHouse", "", "Журнал событий доставки, SLO-аналитика")
+  Container(obs, "Observability", "OpenTelemetry Collector, Prometheus, Grafana, Tempo, Loki", "Все контейнеры отправляют метрики, трейсы и логи. SLO-алерты через Alertmanager")
+}
+
+System_Ext(fcm, "FCM / APNs", "Push-провайдеры")
+System_Ext(sms, "SMS-провайдеры A и B", "SMPP / HTTP, DLR-вебхуки")
+System_Ext(email, "Email-провайдеры", "SMTP / HTTP, вебхуки delivered/bounce")
+
+Rel(producers, api, "SendNotification", "gRPC")
+Rel(api, kafka, "requests", "acks=all")
+Rel(kafka, orch, "requests, delivery.events")
+Rel(orch, statedb, "состояние, попытки, дедлайны", "SQL, условные UPDATE")
+Rel(orch, redis, "настройки, токены", "RESP")
+Rel(orch, kafka, "commands.*, notif.status")
+Rel(sched, statedb, "истёкшие дедлайны", "SKIP LOCKED")
+Rel(sched, kafka, "TIMEOUT → delivery.events")
+Rel(kafka, push, "commands.push")
+Rel(kafka, smsw, "commands.sms")
+Rel(kafka, emailw, "commands.email")
+Rel(push, fcm, "send", "HTTP/2")
+Rel(smsw, sms, "submit", "SMPP/HTTP")
+Rel(emailw, email, "send", "SMTP/HTTP")
+Rel(push, kafka, "результат попытки")
+Rel(smsw, kafka, "результат попытки")
+Rel(emailw, kafka, "результат попытки")
+Rel(fcm, client, "push")
+Rel(sms, client, "SMS")
+Rel(email, client, "email")
+Rel(client, receipts, "ACK о показе push", "HTTPS")
+Rel(sms, receipts, "DLR", "webhook")
+Rel(email, receipts, "delivered / bounce", "webhook")
+Rel(receipts, kafka, "RECEIPT → delivery.events")
+Rel(prefs, redis, "инвалидация кеша при изменении")
+Rel(kafka, ch, "notif.status, delivery.events", "Kafka engine")
+Rel(status, ch, "история", "SQL")
+Rel(status, statedb, "текущий статус", "SQL")
+@enduml

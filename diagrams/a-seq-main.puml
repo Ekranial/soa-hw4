@@ -1,0 +1,45 @@
+@startuml a-seq-main
+title Вариант A. Основной сценарий: транзакционное уведомление доставлено через push
+autonumber
+skinparam responseMessageBelowArrow true
+
+participant "Платёжный\nсервис" as P
+participant "Notification\nAPI" as API
+queue "Kafka" as K
+participant "Delivery\nOrchestrator" as O
+database "Redis\n(кеш)" as R
+database "Delivery\nState DB" as DB
+participant "Push\nSender" as PS
+participant "FCM /\nAPNs" as FCM
+actor "Мобильное\nприложение" as APP
+participant "Receipt\nGateway" as RG
+
+P -> API: SendNotification(idempotency_key = "pay-123:debited",\ntype = TRANSACTIONAL, user_id, template, params)
+API -> API: валидация;\nnotification_id = UUIDv5(producer, idempotency_key)
+API -> K: produce notif.transactional.requests\n(key = notification_id, acks = all)
+K --> API: ack (запись на 2 из 3 реплик)
+API --> P: 202 Accepted {notification_id}
+note over P, API: Платёж не ждёт доставки: ответ\nприходит за ~10–20 мс
+
+K -> O: consume request
+O -> R: настройки клиента + активные push-токены
+R --> O: preferred = push, токены: [iOS]
+O -> DB: BEGIN; INSERT notification ON CONFLICT (id) DO NOTHING;\nINSERT attempt #1 (push); deadline = now() + 10 с;\nstate = ATTEMPTING; COMMIT
+note right of DB: Повторный запрос с тем же\nidempotency_key даёт тот же id →\nON CONFLICT → дубль не создаётся
+O -> K: produce delivery.commands.push {attempt_id}
+K -> PS: consume
+PS -> FCM: send(token, collapse_id = notification_id,\ndata = {notification_id, attempt_id})
+FCM --> PS: 200 OK (принято провайдером)
+PS -> K: delivery.events: ATTEMPT_ACCEPTED
+K -> O: consume
+O -> DB: UPDATE … SET state = AWAITING_RECEIPT\nWHERE id = ? AND state = ATTEMPTING
+FCM -> APP: push-уведомление
+APP -> APP: показать (дедупликация по notification_id)
+APP -> RG: POST /receipts {notification_id, attempt_id}
+RG -> K: delivery.events: RECEIPT(push)
+K -> O: consume (тот же ключ партиции →\nсобытия одного уведомления по порядку)
+O -> DB: UPDATE notification SET state = DELIVERED\nWHERE id = ? AND state IN (ATTEMPTING, AWAITING_RECEIPT);\nDELETE deadline
+O -> K: notif.status: DELIVERED {channel = push, latency}
+note over O, DB: ACK может прийти раньше, чем обработано\nATTEMPT_ACCEPTED, поэтому подтверждение\nпринимается и в состоянии ATTEMPTING
+note over P, RG: Типичная задержка от шага 1 до доставки: 1–3 с (NFR-1: p95 ≤ 5 с)
+@enduml
